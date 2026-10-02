@@ -49,7 +49,9 @@ def parse_admin_ids(env_string):
             ids.append(int(uid))
     return ids
 
-ADMIN_IDS = parse_admin_ids(os.environ.get("ADMIN_IDS", "0"))
+# ENV se root admins load honge
+ROOT_ADMINS = parse_admin_ids(os.environ.get("ADMIN_IDS", "0"))
+ADMIN_IDS = list(ROOT_ADMINS) # Global list jisme DB wale admins bhi add honge
 
 # ------------------ DATABASE & STATE ------------------
 DB_PATH = Path("bot_data.db")
@@ -64,6 +66,9 @@ recently_welcomed: set[int] = set()
 user_chat_state: dict[int, bool] = {}
 admin_chat_state: dict[int, dict] = {}
 auto_replies: dict[str, str] = {}
+
+# 🔥 NAYA: Global delete track karne ke liye registry
+admin_msg_map: dict[tuple, list] = {} 
 
 def init_db():
     with sqlite3.connect(str(DB_PATH)) as conn:
@@ -94,25 +99,38 @@ def init_db():
                 keyword TEXT PRIMARY KEY,
                 response TEXT
             );
+            CREATE TABLE IF NOT EXISTS admins (
+                user_id INTEGER PRIMARY KEY
+            );
         """)
         return conn
 
 def load_from_db():
-    global tracked_users, blocked_users, saved_messages, button_forwards, welcome_enabled, auto_replies
+    global tracked_users, blocked_users, saved_messages, button_forwards, welcome_enabled, auto_replies, ADMIN_IDS
     with sqlite3.connect(str(DB_PATH)) as conn:
         cur = conn.cursor()
+        
+        # Load extra admins
+        cur.execute("SELECT user_id FROM admins")
+        for (uid,) in cur.fetchall():
+            if uid not in ADMIN_IDS:
+                ADMIN_IDS.append(uid)
+
+        # Load users
         cur.execute("SELECT user_id, access_hash, blocked FROM users")
         for uid, hsh, blk in cur.fetchall():
             tracked_users[uid] = hsh
             if blk:
                 blocked_users.add(uid)
                 
+        # Load messages sequence
         cur.execute("SELECT step, msg_type, text, msg_id, from_chat FROM messages")
         for step, mtype, text, mid, fchat in cur.fetchall():
             saved_messages[step] = {
                 "type": mtype, "text": text, "msg_id": mid, "from_chat": fchat
             }
             
+        # Load button messages
         cur.execute("SELECT btn_key, msg_id, from_chat FROM button_msgs")
         button_forwards.clear()
         for key, mid, fchat in cur.fetchall():
@@ -120,16 +138,18 @@ def load_from_db():
                 button_forwards[key] = []
             button_forwards[key].append({"msg_id": mid, "from_chat": fchat})
             
+        # Load settings
         cur.execute("SELECT value FROM settings WHERE key='welcome_enabled'")
         row = cur.fetchone()
         if row:
             welcome_enabled = row[0] == "1"
             
+        # Load auto replies
         cur.execute("SELECT keyword, response FROM auto_replies")
         for kw, resp in cur.fetchall():
             auto_replies[kw] = resp
             
-    logger.info(f"Loaded {len(tracked_users)} users, {len(auto_replies)} auto-replies.")
+    logger.info(f"Loaded {len(tracked_users)} users, {len(auto_replies)} auto-replies, {len(ADMIN_IDS)} admins.")
 
 def save_user(uid: int, access_hash: int, blocked: bool = False):
     with sqlite3.connect(str(DB_PATH)) as conn:
@@ -189,6 +209,57 @@ def admin_only(func):
         await func(event)
     return wrapper
 
+# ------------------ DYNAMIC ADMIN MANAGEMENT ------------------
+@client.on(events.NewMessage(pattern=r"^/addadmin\s+(\d+)"))
+@admin_only
+async def add_admin(event):
+    try:
+        new_admin_id = int(event.pattern_match.group(1))
+        if new_admin_id in ADMIN_IDS:
+            return await event.reply(f"⚠️ **Notice:** User `{new_admin_id}` pehle se hi admin hai.")
+        
+        ADMIN_IDS.append(new_admin_id)
+        with sqlite3.connect(str(DB_PATH)) as conn:
+            conn.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (new_admin_id,))
+        
+        await event.reply(f"✅ **Success!** Naya admin add ho gaya hai.\n🆔 **UID:** `{new_admin_id}`")
+        try:
+            await client.send_message(new_admin_id, "🎉 **Congratulations!** Aapko is bot ka Admin bana diya gaya hai. Apna panel open karne ke liye `/start` type karein.")
+        except:
+            pass
+    except Exception as e:
+        await event.reply(f"❌ Error: {e}")
+
+@client.on(events.NewMessage(pattern=r"^/deladmin\s+(\d+)"))
+@admin_only
+async def del_admin(event):
+    try:
+        target_admin_id = int(event.pattern_match.group(1))
+        
+        if target_admin_id in ROOT_ADMINS:
+            return await event.reply("❌ **Access Denied:** Ye user ek Root Admin (Env var) hai. Ise bot se remove nahi kiya ja sakta.")
+            
+        if target_admin_id not in ADMIN_IDS:
+            return await event.reply(f"⚠️ User `{target_admin_id}` admin list mein nahi hai.")
+        
+        ADMIN_IDS.remove(target_admin_id)
+        with sqlite3.connect(str(DB_PATH)) as conn:
+            conn.execute("DELETE FROM admins WHERE user_id=?", (target_admin_id,))
+            
+        await event.reply(f"🗑 **Success!** Admin privileges hata di gayi hain.\n🆔 **UID:** `{target_admin_id}`")
+    except Exception as e:
+        await event.reply(f"❌ Error: {e}")
+
+@client.on(events.NewMessage(pattern=r"^/listadmins"))
+@admin_only
+async def list_admins(event):
+    msg = "👑 **CURRENT ADMINS:**\n➖➖➖➖➖➖➖➖➖➖➖➖\n"
+    for aid in ADMIN_IDS:
+        role = "⭐ (Root Admin)" if aid in ROOT_ADMINS else "🔹 (Sub Admin)"
+        msg += f"{role} `{aid}`\n"
+    msg += "➖➖➖➖➖➖➖➖➖➖➖➖\n👉 Naya add karne ke liye: `/addadmin ID`"
+    await event.reply(msg)
+
 # ------------------ ADMIN ALERTS ------------------
 async def notify_admins_new_user(user):
     first_name = user.first_name or ""
@@ -230,15 +301,10 @@ async def send_user_menu(entity):
         [Button.text("🎧 Contact Support", resize=True)]
     ]
     try:
-        welcome_msg = (
-            "🟢 **SYSTEM ONLINE**\n"
-            "➖➖➖➖➖➖➖➖➖➖\n"
-            "Welcome to the **VIP Panel** ⚡️\n"
-            "Choose an option below to fetch instructions or connect with support."
-        )
-        await client.send_message(entity, welcome_msg, buttons=btns)
-    except Exception:
-        pass
+        safe_text = "👇"  
+        await client.send_message(entity, safe_text, buttons=btns)
+    except Exception as e:
+        logger.error(f"Menu error: {e}")
 
 async def send_welcome_sequence(user):
     uid = user.id
@@ -260,7 +326,6 @@ async def send_welcome_sequence(user):
     is_new_user = uid not in tracked_users
     tracked_users[uid] = access_hash
     
-    # 🌟 FIX: User ne bot start kiya hai matlab wo block list me nahi hona chahiye
     save_user(uid, access_hash, blocked=False)
     blocked_users.discard(uid)
 
@@ -284,14 +349,12 @@ async def send_welcome_sequence(user):
                 await client.send_message(full_user, item["text"])
             await asyncio.sleep(0.5)
         except UserIsBlockedError:
-            # 🌟 FIX: Sirf tabhi block list me dalo jab SACCHI ME UserIsBlockedError aaye
             blocked_users.add(uid)
             save_user(uid, access_hash, blocked=True)
             return
         except FloodWaitError as e:
             await asyncio.sleep(e.seconds)
         except Exception:
-            # 🌟 FIX: PeerIdInvalidError ya koi dusra error aaye toh skip karo, block mat karo
             continue
             
     asyncio.create_task(remove_welcome_cooldown(uid))
@@ -321,7 +384,6 @@ async def start(event):
     user_chat_state[event.sender_id] = False 
     admin_chat_state.pop(event.sender_id, None)
     
-    # 🌟 FIX: Agar user ne start kiya hai, aur galti se block list mein tha, toh waapas nikaalo
     if event.sender_id in blocked_users:
         blocked_users.discard(event.sender_id)
         access_hash = tracked_users.get(event.sender_id, 0)
@@ -334,7 +396,7 @@ async def start(event):
             [Button.text("🔢 Set Sequence"), Button.text("🔇 Toggle Welcome")],
             [Button.text("📁 Backup"), Button.text("🔄 Restore")],
             [Button.text("🔘 Set Button"), Button.text("🗑 Clear Button")],
-            [Button.text("🧹 Cleanup")]
+            [Button.text("👑 Manage Admins"), Button.text("🧹 Cleanup")]
         ]
         admin_panel_text = (
             "👨‍💻 **ADMIN CONTROL PANEL**\n"
@@ -364,7 +426,7 @@ async def contact_admin_handler(event):
         return
         
     user_chat_state[event.sender_id] = True
-    await event.reply("📝 **Support Session Active** 🟢\n\nAb aap apna message ya screenshot yahan bhej sakte hain. Seedha admin tak pahunch jayega! 👇")
+    await event.reply("📝 **Support Section** 🟢\n\nAdmin Contact id - @SahilOfficial")
 
 async def send_button_forward(event, key):
     uid = event.sender_id
@@ -417,7 +479,6 @@ async def send_button_forward(event, key):
             await status_msg.delete() 
             
     except UserIsBlockedError:
-        # 🌟 FIX: User ne sach me block kiya toh list me daalo, par msg edit nahi kar sakte kyuki blocked hai.
         blocked_users.add(uid)
         save_user(uid, tracked_users.get(uid, 0), blocked=True)
     except FloodWaitError as e:
@@ -426,6 +487,39 @@ async def send_button_forward(event, key):
         logger.error(f"Button {key} error for {uid}: {e}")
         await status_msg.edit("❌ An error occurred. Please try again later.")
 
+# 🔥 ------------------ GLOBAL DELETE COMMAND ------------------ 🔥
+@client.on(events.NewMessage(pattern=r"^/del$"))
+@admin_only
+async def global_delete(event):
+    if not event.is_reply:
+        return await event.reply("❌ `[Error] Please reply to the user's message with /del to wipe it.`")
+    
+    replied = await event.get_reply_message()
+    key = (event.chat_id, replied.id)
+    
+    if key in admin_msg_map:
+        target_msgs = admin_msg_map[key]
+        for adm_id, msg_id in target_msgs:
+            try:
+                await client.delete_messages(adm_id, [msg_id])
+            except Exception:
+                pass
+        
+        for adm_id, msg_id in target_msgs:
+            admin_msg_map.pop((adm_id, msg_id), None)
+            
+        del_confirm = await event.respond("✅ `[sys] Message wiped globally from all Admin panels.`")
+        
+        try: await event.delete() 
+        except: pass
+        await asyncio.sleep(3)
+        try: await del_confirm.delete() 
+        except: pass
+    else:
+        warn = await event.reply("⚠️ `[Notice] Cannot wipe. Message not found in active global registry.`")
+        await asyncio.sleep(3)
+        try: await warn.delete()
+        except: pass
 
 # ------------------ ADMIN SMART SEND MESSAGE ------------------
 @client.on(events.NewMessage(pattern=r"^✉️ Send Message$"))
@@ -490,7 +584,6 @@ async def handle_admin_chat_state(event):
             await event.respond(f"✅ **Message successfully delivered to `{target_id}`!**")
             del admin_chat_state[admin_id]
         except UserIsBlockedError:
-            # 🌟 FIX: SACCHI MEIN BLOCKED HAI
             blocked_users.add(target_id)
             save_user(target_id, tracked_users.get(target_id, 0), blocked=True)
             await event.respond(f"❌ `[Error] Delivery Failed: User blocked the bot.`")
@@ -570,6 +663,7 @@ async def stats(event):
         "📊 **BOT STATISTICS & METRICS**\n"
         "➖➖➖➖➖➖➖➖➖➖➖➖\n"
         f"👥 **Active Users:** `{len(tracked_users)}`\n"
+        f"👑 **Total Admins:** `{len(ADMIN_IDS)}`\n"
         f"🚫 **Blocked Users:** `{len(blocked_users)}`\n"
         f"🤖 **Auto-Replies:** `{len(auto_replies)}`\n"
         f"🔊 **Welcome Status:** `{'🟢 ON' if welcome_enabled else '🔴 OFF'}`\n\n"
@@ -585,7 +679,7 @@ async def stats(event):
 @admin_only
 async def status(event):
     steps = "\n".join(f"  {s}: {d['type']}" for s, d in sorted(saved_messages.items()))
-    await event.reply(f"⚙️ **System Status**\nUsers: `{len(tracked_users)}`\nBlocked: `{len(blocked_users)}`\nSequence:\n{steps if steps else 'none'}")
+    await event.reply(f"⚙️ **System Status**\nUsers: `{len(tracked_users)}`\nAdmins: `{len(ADMIN_IDS)}`\nBlocked: `{len(blocked_users)}`\nSequence:\n{steps if steps else 'none'}")
 
 @client.on(events.NewMessage(pattern=r"^/broadcast"))
 @admin_only
@@ -611,12 +705,10 @@ async def broadcast(event):
             success += 1
             await asyncio.sleep(0.3)
         except UserIsBlockedError:
-            # 🌟 FIX: Strict blocking in broadcast
             blocked_users.add(uid)
             save_user(uid, old_hash, blocked=True)
             fail += 1
         except Exception:
-            # Baki errors ignore karo, block mat karo
             fail += 1
 
     await status_msg.edit(f"✅ **Broadcast Completed**\n➖➖➖➖➖➖➖➖\n✅ Delivered: `{success}`\n❌ Failed: `{fail}`\n⏭ Skipped: `{skip}`")
@@ -699,13 +791,16 @@ async def toggle_welcome(event):
 @client.on(events.NewMessage(pattern=r"^(/backup|📁 Backup)$"))
 @admin_only
 async def backup(event):
+    # Added admins to backup
+    db_admins = [a for a in ADMIN_IDS if a not in ROOT_ADMINS]
     data = {
         "tracked": tracked_users,
         "blocked": list(blocked_users),
         "messages": {str(k): v for k, v in saved_messages.items()},
         "button_forwards": button_forwards,
         "welcome": welcome_enabled,
-        "auto_replies": auto_replies
+        "auto_replies": auto_replies,
+        "db_admins": db_admins
     }
     file = "backup.json"
     with open(file, "w") as f: json.dump(data, f)
@@ -721,19 +816,22 @@ async def restore(event):
     path = await client.download_media(rep.media)
     try:
         with open(path, "r") as f: data = json.load(f)
-        global tracked_users, blocked_users, saved_messages, button_forwards, welcome_enabled, auto_replies
+        global tracked_users, blocked_users, saved_messages, button_forwards, welcome_enabled, auto_replies, ADMIN_IDS
+        
         tracked_users = {int(k): int(v) for k, v in data.get("tracked", {}).items()}
         blocked_users = set(int(u) for u in data.get("blocked", []))
         saved_messages = {int(k): v for k, v in data.get("messages", {}).items()}
         button_forwards = data.get("button_forwards", {})
         welcome_enabled = data.get("welcome", True)
         auto_replies = data.get("auto_replies", {})
+        db_admins = data.get("db_admins", [])
 
         with sqlite3.connect(str(DB_PATH)) as conn:
             conn.execute("DELETE FROM users")
             conn.execute("DELETE FROM messages")
             conn.execute("DELETE FROM button_msgs")
             conn.execute("DELETE FROM auto_replies")
+            conn.execute("DELETE FROM admins")
             
             for uid, hsh in tracked_users.items():
                 conn.execute("INSERT OR REPLACE INTO users (user_id, access_hash, blocked) VALUES (?,?,?)", (uid, hsh, int(uid in blocked_users)))
@@ -744,15 +842,19 @@ async def restore(event):
                 for cfg in cfg_list: conn.execute("INSERT INTO button_msgs (btn_key, msg_id, from_chat) VALUES (?,?,?)", (key, cfg["msg_id"], cfg["from_chat"]))
             for kw, resp in auto_replies.items():
                 conn.execute("INSERT OR REPLACE INTO auto_replies (keyword, response) VALUES (?,?)", (kw, resp))
+            for admin_id in db_admins:
+                conn.execute("INSERT INTO admins (user_id) VALUES (?)", (admin_id,))
+                if admin_id not in ADMIN_IDS:
+                    ADMIN_IDS.append(admin_id)
                 
         set_setting("welcome_enabled", "1" if welcome_enabled else "0")
-        await event.reply(f"✅ **Restore Successful:** Loaded `{len(tracked_users)}` users.")
+        await event.reply(f"✅ **Restore Successful:** Loaded `{len(tracked_users)}` users and `{len(db_admins)}` extra admins.")
     except Exception as e:
         await event.reply(f"❌ Restore failed: {e}")
     finally:
         if os.path.exists(path): os.remove(path)
 
-@client.on(events.NewMessage(pattern=r"^(📢 Broadcast|🔢 Set Sequence|🔘 Set Button|🗑 Clear Button)$"))
+@client.on(events.NewMessage(pattern=r"^(📢 Broadcast|🔢 Set Sequence|🔘 Set Button|🗑 Clear Button|👑 Manage Admins)$"))
 @admin_only
 async def helper_buttons(event):
     text = event.text
@@ -760,6 +862,16 @@ async def helper_buttons(event):
     elif text == "🔢 Set Sequence": await event.reply("🔢 **How to Set Sequence:**\n👉 Send `/setmsg1 <text>` or reply to a message.")
     elif text == "🔘 Set Button": await event.reply("🔘 **How to Set Buttons:**\n👉 Step 1: `/setbutton hack` (reply to message)\n👉 Step 2: `/addbutton hack` (to stack more)")
     elif text == "🗑 Clear Button": await event.reply("🗑 **How to Clear:**\n👉 Use `/clearbutton hack` or `/clearbutton prediction`.")
+    elif text == "👑 Manage Admins":
+        help_text = (
+            "👑 **ADMIN MANAGEMENT PANEL**\n"
+            "➖➖➖➖➖➖➖➖➖➖➖➖\n"
+            "👉 **Add Admin:** `/addadmin <user_id>`\n"
+            "👉 **Remove Admin:** `/deladmin <user_id>`\n"
+            "👉 **List Admins:** `/listadmins`\n\n"
+            "*(Note: Admins set in .env cannot be removed from here)*"
+        )
+        await event.reply(help_text)
 
 @client.on(events.NewMessage(pattern=r"^(📁 Backup|🔄 Restore)$"))
 @admin_only
@@ -770,19 +882,22 @@ async def backup_restore_buttons(event):
         if os.path.exists("auto_backup.json"):
             try:
                 with open("auto_backup.json", "r") as f: data = json.load(f)
-                global tracked_users, blocked_users, saved_messages, button_forwards, welcome_enabled, auto_replies
+                global tracked_users, blocked_users, saved_messages, button_forwards, welcome_enabled, auto_replies, ADMIN_IDS
+                
                 tracked_users = {int(k): int(v) for k, v in data.get("tracked", {}).items()}
                 blocked_users = set(int(u) for u in data.get("blocked", []))
                 saved_messages = {int(k): v for k, v in data.get("messages", {}).items()}
                 button_forwards = data.get("button_forwards", {})
                 welcome_enabled = data.get("welcome", True)
                 auto_replies = data.get("auto_replies", {})
+                db_admins = data.get("db_admins", [])
                 
                 with sqlite3.connect(str(DB_PATH)) as conn:
                     conn.execute("DELETE FROM users")
                     conn.execute("DELETE FROM messages")
                     conn.execute("DELETE FROM button_msgs")
                     conn.execute("DELETE FROM auto_replies")
+                    conn.execute("DELETE FROM admins")
                     
                     for uid, hsh in tracked_users.items(): conn.execute("INSERT OR REPLACE INTO users (user_id, access_hash, blocked) VALUES (?,?,?)", (uid, hsh, int(uid in blocked_users)))
                     for step, d in saved_messages.items(): conn.execute("INSERT OR REPLACE INTO messages (step, msg_type, text, msg_id, from_chat) VALUES (?,?,?,?,?)", (step, d.get("type"), d.get("text"), d.get("msg_id"), d.get("from_chat")))
@@ -791,6 +906,10 @@ async def backup_restore_buttons(event):
                         for cfg in cfg_list: conn.execute("INSERT INTO button_msgs (btn_key, msg_id, from_chat) VALUES (?,?,?)", (key, cfg["msg_id"], cfg["from_chat"]))
                     for kw, resp in auto_replies.items():
                         conn.execute("INSERT OR REPLACE INTO auto_replies (keyword, response) VALUES (?,?)", (kw, resp))
+                    for admin_id in db_admins:
+                        conn.execute("INSERT INTO admins (user_id) VALUES (?)", (admin_id,))
+                        if admin_id not in ADMIN_IDS:
+                            ADMIN_IDS.append(admin_id)
                         
                 set_setting("welcome_enabled", "1" if welcome_enabled else "0")
                 await event.reply(f"✅ Restored from auto-backup successfully. Active users: `{len(tracked_users)}`")
@@ -816,8 +935,10 @@ async def seamless_chat_handler(event):
 
     text = event.raw_text.lower() if event.raw_text else ""
     
-    if text.startswith('/') or "✉️ send message" in text or "📢 broadcast" in text or "📊 stats" in text or "⚙️ status" in text or "🔢 set sequence" in text or "🔇 toggle welcome" in text or "📁 backup" in text or "🔄 restore" in text or "🔘 set button" in text or "🗑 clear button" in text or "🧹 cleanup" in text:
+    # Ignore admin commands
+    if text.startswith('/') or "✉️ send message" in text or "📢 broadcast" in text or "📊 stats" in text or "⚙️ status" in text or "🔢 set sequence" in text or "🔇 toggle welcome" in text or "📁 backup" in text or "🔄 restore" in text or "🔘 set button" in text or "🗑 clear button" in text or "🧹 cleanup" in text or "👑 manage admins" in text:
         return
+    # Ignore main user buttons
     if "number hack" in text or "colour trading" in text or "contact support" in text:
         return
 
@@ -848,11 +969,19 @@ async def seamless_chat_handler(event):
             )
             
             if event.raw_text: caption += f"\n📝 **Message:**\n{event.raw_text}"
-            caption += "\n\n👇 *(Reply to this message to answer)*"
-                
+            caption += "\n\n👇 *(Reply or use /del to wipe this)*"
+            
+            sent_admin_msgs = []
             for admin_id in ADMIN_IDS:
-                try: await client.send_message(admin_id, caption, file=event.media)
-                except Exception: pass
+                try: 
+                    sent_msg = await client.send_message(admin_id, caption, file=event.media)
+                    sent_admin_msgs.append((admin_id, sent_msg.id))
+                except Exception: 
+                    pass
+            
+            if sent_admin_msgs:
+                for adm_id, msg_id in sent_admin_msgs:
+                    admin_msg_map[(adm_id, msg_id)] = sent_admin_msgs
                     
             try:
                 if not bot_auto_replied:
@@ -892,7 +1021,6 @@ async def seamless_chat_handler(event):
                     except Exception: pass
                         
                 except UserIsBlockedError:
-                    # 🌟 FIX: User ne block kiya hai
                     blocked_users.add(target_uid)
                     save_user(target_uid, tracked_users.get(target_uid, 0), blocked=True)
                     await event.reply(f"❌ `[Error] Transmission failed: User blocked the bot.`")
@@ -904,21 +1032,22 @@ async def periodic_backup():
     while True:
         await asyncio.sleep(6 * 3600)  # Har 6 ghante mein run hoga
         try:
+            db_admins = [a for a in ADMIN_IDS if a not in ROOT_ADMINS]
             data = {
                 "tracked": tracked_users,
                 "blocked": list(blocked_users),
                 "messages": {str(k): v for k, v in saved_messages.items()},
                 "button_forwards": button_forwards,
                 "welcome": welcome_enabled,
-                "auto_replies": auto_replies
+                "auto_replies": auto_replies,
+                "db_admins": db_admins
             }
             file = "auto_backup.json"
             with open(file, "w") as f:
                 json.dump(data, f)
             
-            # Har 6 ghante baad backup file seedha saare Admins ko bhej do!
-            caption = f"📁 `[Automatic 6-Hour Database Backup]`\n📊 Total Active Users: `{len(tracked_users)}`"
-            for admin_id in ADMIN_IDS:
+            caption = f"📁 `[Automatic 6-Hour Database Backup]`\n📊 Active Users: `{len(tracked_users)}` | Admins: `{len(ADMIN_IDS)}`"
+            for admin_id in ROOT_ADMINS: # Sirf root admins ko backup bhejna zyada safe hai
                 try:
                     await client.send_file(admin_id, file, caption=caption)
                 except Exception as e:
